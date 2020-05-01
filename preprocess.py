@@ -472,7 +472,7 @@ def preprocess(dataset, remove_from=False):
   if remove_from:
     output_vocab = ['_UNK', '_EOS', '=', 'select', 'value', ')', '(', 'where', ',', 'count', 'group_by', 'order_by', 'distinct', 'and', 'limit_value', 'limit', 'desc', '>', 'avg', 'having', 'max', 'in', '<', 'sum', 'intersect', 'not', 'min', 'except', 'or', 'asc', 'like', '!=', 'union', 'between', '-', '+', '/']
   print('size of output_vocab', len(output_vocab))
-  print('output_vocab', output_vocab)
+  # print('output_vocab', output_vocab)
   print()
 
   if dataset == 'spider':

@@ -89,6 +89,33 @@ class ATISDataset():
                 is_input='output',
                 anonymizer=self.anonymizer if params.anonymization_scoring else None,
                 skip=skip_tokens)
+
+            self.dis_src_vocab = ATISVocabulary(
+                all_input_seqs,
+                os.path.join(params.data_directory,
+                             params.dis_src_vocab_filename),
+                params,
+                is_input='input',
+                anonymizer=None
+            )
+
+            column_names_embedder_input_flat = []
+            for entry in column_names_embedder_input:
+                column_names_embedder_input_flat.extend(entry)
+
+            dis_skip_tokens = list(set(column_names_surface_form)
+                                   - set(sql_keywords)
+                                   - set(column_names_embedder_input_flat))
+            self.dis_tgt_vocab = ATISVocabulary(
+                all_output_seqs + column_names_embedder_input,
+                os.path.join(params.data_directory,
+                             params.dis_tgt_vocab_filename),
+                params,
+                is_input='output',
+                anonymizer=None,
+                skip=dis_skip_tokens
+            )
+
         else:
             self.train_data = ds.DatasetSplit(
                 os.path.join(params.data_directory, params.processed_train_filename),

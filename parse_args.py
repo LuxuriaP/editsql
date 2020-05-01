@@ -104,7 +104,7 @@ def interpret_args():
 
     ### Training parameters
     parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--train_maximum_sql_length', type=int, default=200)
+    parser.add_argument('--train_maximum_sql_length', type=int, default=50)
     parser.add_argument('--train_evaluation_size', type=int, default=100)
 
     parser.add_argument('--dropout_amount', type=float, default=0.5)
@@ -129,7 +129,7 @@ def interpret_args():
     parser.add_argument('--use_predicted_queries', type=bool, default=False)
     parser.add_argument('--evaluate_split', type=str, default='dev')
     parser.add_argument('--evaluate_with_gold_forcing', type=bool, default=False)
-    parser.add_argument('--eval_maximum_sql_length', type=int, default=1000)
+    parser.add_argument('--eval_maximum_sql_length', type=int, default=50)
     parser.add_argument('--results_note', type=str, default='')
     parser.add_argument('--compute_metrics', type=bool, default=False)
 
@@ -141,12 +141,71 @@ def interpret_args():
     parser.add_argument('--database_password', type=str, default="aviarmy")
     parser.add_argument('--database_timeout', type=int, default=2)
 
+    # GAN arguments
+    parser.add_argument('--gan', type=bool, default=False)
+    parser.add_argument('--samples_dir', type=str, default="samples")
+
+    # generator arguments
+    parser.add_argument('--gen_acc_threshold', type=float, default=80.)
+    parser.add_argument('--is_sampling', type=bool, default=False)
+    parser.add_argument('--consolidate', type=bool, default=False)
+
+    # discriminator arguments
+    parser.add_argument('--pretrain_discriminator', type=bool, default=False)
+    parser.add_argument('--dis_src_vocab_filename', type=str, default="dis_src_vocab.pkl")
+    parser.add_argument('--dis_tgt_vocab_filename', type=str, default="dis_tgt_vocab.pkl")
+    parser.add_argument('--max_gen_len', type=int, default=50)
+    parser.add_argument('--max_pos_emb', type=int, default=0)
+    parser.add_argument('--num_tok_type', type=int, default=0)
+    parser.add_argument('--num_dis_classes', type=int, default=2)
+    parser.add_argument('--dis_dropout', type=float, default=0.75)
+    parser.add_argument('--dis_logfile', type=str, default="dis_log.txt")
+    parser.add_argument('--real_train_file', type=str, default="positive_train.json")
+    parser.add_argument('--fake_train_file', type=str, default="negative_train.json")
+    parser.add_argument('--real_valid_file', type=str, default="positive_valid.json")
+    parser.add_argument('--fake_valid_file', type=str, default="negative_valid.json")
+    parser.add_argument('--num_dis_epoch', type=int, default=10)
+    parser.add_argument('--dis_batch_size', type=int, default=64)
+    parser.add_argument('--train_accuracy_threshold', type=float, default=.8)
+    parser.add_argument('--dis_save_file', type=str, default="dis_save.pt")     # not used
+    parser.add_argument('--dis_args_file', type=str, default="/dis_args.log")
+    parser.add_argument('--generated_train', type=bool, default=False)
+    parser.add_argument('--generated_valid', type=bool, default=False)
+
+    # adversarial arguments
+    parser.add_argument('--adversarial_training', type=bool, default=False)
+    parser.add_argument('--adv_logfile', type=str, default="adv_log.txt")
+    parser.add_argument('--adv_epoch', type=int, default=1)
+    parser.add_argument('--roll_num', type=int, default=10)
+    parser.add_argument('--gen_num', type=int, default=1000)
+    parser.add_argument('--adv_real_file', type=str, default="positive_adv.json")
+    parser.add_argument('--adv_fake_file', type=str, default="negative_adv.json")
+    parser.add_argument('--gan_batch_size', type=int, default=250)
+    parser.add_argument('--max_epoch', type=int, default=0)
+    parser.add_argument('--teacher_forcing', type=bool, default=False)
+    parser.add_argument('--mle', type=str, default=None)
+    parser.add_argument('--bias', type=float, default=0.)
+    parser.add_argument('--step_size', type=int, default=1)
+    parser.add_argument('--adv_args_file', type=str, default="/adv_args.log")
+    parser.add_argument('--adv_real_valid', type=str, default="pos_v_adv.json")
+    parser.add_argument('--adv_fake_valid', type=str, default="neg_v_adv.json")
+    parser.add_argument('--dis_k_steps', type=int, default=3)
+
+    # checkpoint
+    parser.add_argument('--gen_pretrain_ckp', type=str, default='gen_pretrain_ckp.pt')
+    parser.add_argument('--dis_pretrain_ckp', type=str, default='dis_pretrain_ckp.pt')
+    parser.add_argument('--adv_ckp', type=str, default='adv_ckp_test.pt')
+    parser.add_argument('--gen_from_ckp', type=bool, default=False)
+    parser.add_argument('--dis_from_ckp', type=bool, default=False)
+    parser.add_argument('--adv_from_ckp', type=bool, default=False)
+
     args = parser.parse_args()
 
     if not os.path.exists(args.logdir):
         os.makedirs(args.logdir)
 
-    if not (args.train or args.evaluate or args.interactive or args.attention):
+    if not (args.train or args.evaluate or args.interactive or args.attention
+            or args.pretrain_discriminator or args.adversarial_training):
         raise ValueError('You need to be training or evaluating')
     if args.enable_testing and not args.evaluate:
         raise ValueError('You should evaluate the model if enabling testing')
@@ -157,5 +216,19 @@ def interpret_args():
             raise ValueError('Warning: arguments already exist in ' + str(args_file))
         with open(args_file, 'w') as infile:
             infile.write(str(args))
-           
+
+    if args.pretrain_discriminator:
+        dis_args_file = args.logdir + args.dis_args_file
+        if os.path.exists(dis_args_file):
+            raise ValueError('Warning: arguments already exist in ' + str(dis_args_file))
+        with open(dis_args_file, 'w') as infile:
+            infile.write(str(args))
+
+    if args.adversarial_training:
+        adv_args_file = args.logdir + args.adv_args_file
+        if os.path.exists(adv_args_file):
+            raise ValueError('Warning: arguments already exist in ' + str(adv_args_file))
+        with open(adv_args_file, 'w') as infile:
+            infile.write(str(args))
+
     return args

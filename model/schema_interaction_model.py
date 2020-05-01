@@ -4,8 +4,12 @@ import torch
 import torch.nn.functional as F
 from . import torch_utils
 
+import numpy as np
+import os
+import copy
+
 import data_util.snippets as snippet_handler
-import data_util.sql_util
+from data_util import sql_util
 import data_util.vocabulary as vocab
 from data_util.vocabulary import EOS_TOK, UNK_TOK
 import data_util.tokenizers
@@ -98,6 +102,10 @@ class SchemaInteractionATISModel(ATISModel):
 
         self.decoder = SequencePredictorWithSchema(params, decoder_input_size, self.output_embedder, self.column_name_token_embedder, self.token_predictor)
 
+        self.path = os.path.join(params.samples_dir, "encodings.pt")
+        self.q_enc = None
+        self.q_mem = None
+        self.s_mem = None
 
     def predict_turn(self,
                      utterance_final_state,
@@ -111,7 +119,8 @@ class SchemaInteractionATISModel(ATISModel):
                      previous_query_states=None,
                      input_schema=None,
                      feed_gold_tokens=False,
-                     training=False):
+                     training=False,
+                     sampling=False):
         """ Gets a prediction for a single turn -- calls decoder and updates loss, etc.
 
         TODO:  this can probably be split into two methods, one that just predicts
@@ -155,7 +164,8 @@ class SchemaInteractionATISModel(ATISModel):
                                            previous_query_states=previous_query_states,
                                            input_schema=input_schema,
                                            snippets=snippets,
-                                           dropout_amount=self.dropout)
+                                           dropout_amount=self.dropout,
+                                           sampling=sampling)
 
             all_scores = []
             all_alignments = []
@@ -189,7 +199,8 @@ class SchemaInteractionATISModel(ATISModel):
                                            previous_query_states=previous_query_states,
                                            input_schema=input_schema,
                                            snippets=snippets,
-                                           dropout_amount=self.dropout)
+                                           dropout_amount=self.dropout,
+                                           sampling=sampling)
             predicted_sequence = decoder_results.sequence
             fed_sequence = predicted_sequence
 
@@ -333,7 +344,469 @@ class SchemaInteractionATISModel(ATISModel):
 
         return previous_queries, previous_query_states
 
-    def train_step(self, interaction, max_generation_length, snippet_alignment_probability=1.):
+    def forward(self, interaction, max_generation_length, sampling=False,
+                forcing=False):
+        """ Only for single utterance interaction (Spider). """
+        input_schema = interaction.get_schema()
+        if input_schema and not self.params.use_bert:
+            schema_states = self.encode_schema_bow_simple(input_schema)
+
+        try:
+            utterance, = interaction.gold_utterances()
+        except ValueError:
+            utterance = interaction.gold_utterances()[0]
+            print("Interaction contains multiple utterances.")
+
+        input_sequence = utterance.input_sequence()
+
+        if not self.params.use_bert:
+            final_utterance_state, utterance_states = \
+                self.utterance_encoder(input_sequence,
+                                       self.input_embedder,
+                                       dropout_amount=self.dropout)
+        else:
+            final_utterance_state, utterance_states, schema_states = \
+                self.get_bert_encoding(input_sequence,
+                                       input_schema,
+                                       [],
+                                       dropout=True)
+
+        if self.params.use_encoder_attention:
+            schema_attention = \
+                self.utterance2schema_attention_module(
+                    torch.stack(schema_states, dim=0),
+                    utterance_states
+                ).vector
+            utterance_attention = \
+                self.schema2utterance_attention_module(
+                    torch.stack(utterance_states, dim=0),
+                    schema_states
+                ).vector
+
+            if schema_attention.dim() == 1:
+                schema_attention = schema_attention.unsqueeze(1)
+            if utterance_attention.dim() == 1:
+                utterance_attention = utterance_attention.unsqueeze(1)
+
+            schema_states = torch.cat(
+                [torch.stack(schema_states, dim=1),
+                 schema_attention],
+                dim=0)
+            schema_states = list(
+                torch.split(schema_states,
+                            split_size_or_sections=1,
+                            dim=1))
+            schema_states = [schema_state.squeeze()
+                             for schema_state in schema_states]
+
+            utterance_states = torch.cat(
+                [torch.stack(utterance_states, dim=1),
+                 utterance_attention],
+                dim=0)
+            utterance_states = list(
+                torch.split(utterance_states,
+                            split_size_or_sections=1,
+                            dim=1))
+            utterance_states = [utterance_state.squeeze()
+                                for utterance_state in utterance_states]
+
+            if self.params.use_schema_encoder_2:
+                _, schema_states = \
+                    self.schema_encoder_2(schema_states,
+                                          lambda x: x,
+                                          dropout_amount=self.dropout)
+                _, utterance_states = \
+                    self.utterance_encoder_2(utterance_states,
+                                             lambda x: x,
+                                             dropout_amount=self.dropout)
+
+        # encodings = {
+        #     "q_enc": ([state.cpu().detach().numpy() for state in final_utterance_state[0]],
+        #               [state.cpu().detach().numpy() for state in final_utterance_state[1]]),
+        #     "q_mem": [state.cpu().detach().numpy() for state in utterance_states],
+        #     "s_mem": [state.cpu().detach().numpy() for state in schema_states]
+        # }
+
+        # self.save_encodings(encodings)
+        if forcing:
+            sample = self.decoder(
+                final_utterance_state,
+                utterance_states,
+                schema_states,
+                max_generation_length,
+                input_schema=input_schema,
+                dropout_amount=self.dropout,
+                gold_sequence=utterance.gold_query(),
+                sampling=sampling
+            )
+        else:
+            sample = self.decoder(
+                final_utterance_state,
+                utterance_states,
+                schema_states,
+                max_generation_length,
+                input_schema=input_schema,
+                dropout_amount=self.dropout,
+                sampling=sampling
+            )
+
+        if self.params.consolidate:
+            prob = []
+            for i, prediction in enumerate(sample.predictions):
+                prob_ = F.softmax(prediction.scores, dim=0)  # vocab_size
+                multi_hot = torch.zeros(prob_.size(), dtype=torch.bool).cuda()
+                multi_hot.scatter_(0, sample.indices[i], True)
+                prob_ = torch.sum(torch.masked_select(prob_, multi_hot))
+                prob.append(prob_)
+            prob = torch.stack(prob).squeeze()
+        else:
+            scores = []
+            for prediction in sample.predictions:
+                scores.append(prediction.scores)
+            scores = torch.stack(scores, dim=0)
+            prob = F.softmax(scores, dim=1)     # seq_len x vocab_size
+            one_hot = torch.zeros((scores.size()), dtype=torch.bool).cuda()
+            one_hot.scatter_(1, sample.indices.data.view((-1, 1)), True)
+            prob = torch.masked_select(prob, one_hot)
+
+        # for i in range(1):
+        #     for state in encodings['q_enc'][i]:
+        #         del state
+        # for state in encodings['q_mem']:
+        #     del state
+        # for state in encodings['s_mem']:
+        #     del state
+
+        torch.cuda.empty_cache()
+
+        # prevent discriminator from classifying based on EOS
+        # also, change surface form to embedder input
+        sample_mod = []
+        for tok in sample.sequence:
+            if input_schema.in_vocabulary(tok, surface_form=True):
+                sample_mod.extend(input_schema.sf_to_emb_in(tok).split())
+            elif tok == EOS_TOK:
+                break
+            else:
+                sample_mod.append(tok)
+
+        return sample.sequence, sample_mod, prob, sample.predictions
+
+    def save_encodings(self, encodings):
+        torch.save(encodings, self.path)
+
+    def load_encodings(self):
+        encodings = torch.load(self.path)
+        q_enc = encodings["q_enc"]
+        q_mem = encodings["q_mem"]
+        s_mem = encodings["s_mem"]
+
+        q_enc = ([torch.Tensor(state).cuda() for state in q_enc[0]],
+                 [torch.Tensor(state).cuda() for state in q_enc[1]])
+        q_mem = [torch.Tensor(state).cuda() for state in q_mem]
+        s_mem = [torch.Tensor(state).cuda() for state in s_mem]
+
+        return q_enc, q_mem, s_mem
+
+    def sample(self, max_generation_length, interaction,
+               given=None, given_preds=None,
+               # final_utterance_state=None,
+               # utterance_states=None,
+               # schema_states=None
+               ):
+        """ Only for single utterance interaction (Spider). """
+
+        input_schema = interaction.get_schema()
+
+        # if final_utterance_state is None \
+        #         or utterance_states is None \
+        #         or schema_states is None \
+        #         or input_schema is None:
+        if self.q_enc is None or self.q_mem is None or self.s_mem is None:
+            if input_schema and not self.params.use_bert:
+                schema_states = self.encode_schema_bow_simple(input_schema)
+
+            try:
+                utterance, = interaction.gold_utterances()
+            except ValueError:
+                utterance = interaction.gold_utterances()[0]
+                print("Interaction contains multiple utterances.")
+
+            input_sequence = utterance.input_sequence()
+
+            if not self.params.use_bert:
+                final_utterance_state, utterance_states = \
+                    self.utterance_encoder(input_sequence,
+                                           self.input_embedder,
+                                           dropout_amount=self.dropout)
+            else:
+                final_utterance_state, utterance_states, schema_states = \
+                    self.get_bert_encoding(input_sequence,
+                                           input_schema,
+                                           [],
+                                           dropout=True)
+
+            if self.params.use_encoder_attention:
+                schema_attention = \
+                    self.utterance2schema_attention_module(
+                        torch.stack(schema_states, dim=0),
+                        utterance_states
+                    ).vector
+                utterance_attention = \
+                    self.schema2utterance_attention_module(
+                        torch.stack(utterance_states, dim=0),
+                        schema_states
+                    ).vector
+
+                if schema_attention.dim() == 1:
+                    schema_attention = schema_attention.unsqueeze(1)
+                if utterance_attention.dim() == 1:
+                    utterance_attention = utterance_attention.unsqueeze(1)
+
+                schema_states = torch.cat(
+                    [torch.stack(schema_states, dim=1),
+                     schema_attention],
+                    dim=0)
+                schema_states = list(
+                    torch.split(schema_states,
+                                split_size_or_sections=1,
+                                dim=1))
+                schema_states = [schema_state.squeeze()
+                                 for schema_state in schema_states]
+
+                utterance_states = torch.cat(
+                    [torch.stack(utterance_states, dim=1),
+                     utterance_attention],
+                    dim=0)
+                utterance_states = list(
+                    torch.split(utterance_states,
+                                split_size_or_sections=1,
+                                dim=1))
+                utterance_states = [utterance_state.squeeze()
+                                    for utterance_state in utterance_states]
+
+                if self.params.use_schema_encoder_2:
+                    _, schema_states = \
+                        self.schema_encoder_2(schema_states,
+                                              lambda x: x,
+                                              dropout_amount=self.dropout)
+                    _, utterance_states = \
+                        self.utterance_encoder_2(utterance_states,
+                                                 lambda x: x,
+                                                 dropout_amount=self.dropout)
+            self.q_enc = ([state for state in final_utterance_state[0]],
+                          [state for state in final_utterance_state[1]])
+            self.q_mem = [state for state in utterance_states]
+            self.s_mem = [state for state in schema_states]
+
+        else:
+            final_utterance_state = self.q_enc
+            utterance_states = self.q_mem
+            schema_states = self.s_mem
+
+        # by now, we have all necessary arguments to call decoder.sample
+        sample, _, prob = self.decoder.sample(
+            final_utterance_state,
+            utterance_states,
+            schema_states,
+            max_generation_length,
+            given=given,
+            given_preds=given_preds,
+            input_schema=input_schema,
+            dropout_amount=self.dropout
+        )
+
+        # del final_utterance_state
+        # for state in utterance_states:
+        #     del state
+        # for state in schema_states:
+        #     del state
+
+        torch.cuda.empty_cache()
+
+        # prevent discriminator from classifying based on EOS
+        # also, change surface form to embedder input
+        sample_mod = []
+        for tok in sample:
+            if input_schema.in_vocabulary(tok, surface_form=True):
+                sample_mod.extend(input_schema.sf_to_emb_in(tok).split())
+            elif tok == EOS_TOK:
+                break
+            else:
+                sample_mod.append(tok)
+
+        return sample, sample_mod, prob
+
+    def get_reward(self, sequence, predictions, interaction,
+                   roll_num, max_generation_length, discriminator,
+                   bias=0., mle=False):
+        try:
+            utterance, = interaction.gold_utterances()
+        except ValueError:
+            utterance = interaction.gold_utterances()[0]
+            print("Interaction contains multiple utterances.")
+
+        utterance = utterance.dis_gold_query()
+
+        # q_enc, q_mem, s_mem = self.load_encodings()
+
+        # q_enc = ([torch.Tensor(state).cuda() for state in self.q_enc[0]],
+        #          [torch.Tensor(state).cuda() for state in self.q_enc[1]])
+        # q_mem = [torch.Tensor(state).cuda() for state in self.q_mem]
+        # s_mem = [torch.Tensor(state).cuda() for state in self.s_mem]
+
+        rewards = []
+        seq_len = len(sequence)
+        for i in range(roll_num):
+            for l in range(1, seq_len):
+                given = sequence[:l]
+                given_preds = predictions[:l]
+                _, sample_mod, _ = \
+                    self.sample(
+                        max_generation_length,
+                        interaction,
+                        given=given,
+                        given_preds=given_preds,
+                        # final_utterance_state=q_enc,
+                        # utterance_states=q_mem,
+                        # schema_states=s_mem
+                    )
+                pred = discriminator([utterance], [sample_mod]).squeeze()
+                pred = torch.exp(pred).cpu().data[1].numpy()
+                # if mle:
+                #     pred = pred / (1. - pred)
+                if i == 0:
+                    rewards.append(pred)
+                else:
+                    rewards[l-1] += pred
+
+            # for the last token
+            pred = discriminator([utterance], [sequence]).squeeze()
+            pred = torch.exp(pred).cpu().data[1].numpy()
+            # if mle:
+            #     pred = pred / (1. - pred)
+            if i == 0:
+                rewards.append(pred)
+            else:
+                rewards[-1] += pred
+
+        rewards = np.array(rewards)
+
+        if mle:
+            rewards = rewards / (1.0 * roll_num)
+            rewards = seq_len * rewards / np.sum(rewards)
+        else:
+            if bias > 0.:
+                b = np.zeros_like(rewards)
+                b += bias * roll_num
+                rewards = (rewards - bias) / (1.0 * roll_num)
+            else:
+                rewards = rewards / (1.0 * roll_num)
+
+        # del q_enc
+        # for state in q_mem:
+        #     del state
+        # for state in s_mem:
+        #     del state
+
+        self.q_enc = None
+        self.q_mem = None
+        self.s_mem = None
+
+        torch.cuda.empty_cache()
+        return rewards
+
+    def get_reward_mm(self, sequence, predictions, interaction,
+                      roll_num, max_generation_length, discriminator):
+        try:
+            utterance, = interaction.gold_utterances()
+        except ValueError:
+            utterance = interaction.gold_utterances()[0]
+            print("Interaction contains multiple utterances.")
+
+        utterance = utterance.dis_gold_query()
+
+        # q_enc, q_mem, s_mem = self.load_encodings()
+
+        # q_enc = ([torch.Tensor(state).cuda() for state in self.q_enc[0]],
+        #          [torch.Tensor(state).cuda() for state in self.q_enc[1]])
+        # q_mem = [torch.Tensor(state).cuda() for state in self.q_mem]
+        # s_mem = [torch.Tensor(state).cuda() for state in self.s_mem]
+
+        rewards = []
+        probs = []
+        for i in range(roll_num):
+            _, sample_mod, prob = \
+                self.sample(
+                    max_generation_length,
+                    interaction,
+                    given=sequence,
+                    given_preds=predictions
+                )
+            pred = discriminator([utterance], [sample_mod]).squeeze()
+            pred = torch.exp(pred).cpu().data[1].numpy()
+            pred = pred / (1. - pred)
+            rewards.append(pred)
+            probs.append(prob)
+
+        rewards = np.array(rewards)
+        rewards = rewards / np.sum(rewards)
+        rewards -= np.mean(rewards)
+        probs = torch.cuda.FloatTensor(np.array(probs))
+
+        # del q_enc
+        # for state in q_mem:
+        #     del state
+        # for state in s_mem:
+        #     del state
+
+        self.q_enc = None
+        self.q_mem = None
+        self.s_mem = None
+
+        torch.cuda.empty_cache()
+        return rewards, probs
+
+    def update_gan_loss(self, prob, rewards):
+        assert prob.dim() == 1 and rewards.dim() == 1 \
+               and prob.size()[0] == rewards.size()[0]
+        loss = torch.log(prob) * rewards
+        loss = -torch.sum(loss)
+
+        self.trainer.zero_grad()
+        if self.params.fine_tune_bert:
+            self.bert_trainer.zero_grad()
+        loss.backward()
+        self.trainer.step()
+        if self.params.fine_tune_bert:
+            self.bert_trainer.step()
+
+        loss = loss.item()
+
+        torch.cuda.empty_cache()
+
+        return loss
+
+    def update_gan_loss_mm(self, prob_n, probs, rewards):
+        loss = rewards * torch.log(probs)
+        loss = -torch.sum(loss) + torch.sum(prob_n)
+
+        self.trainer.zero_grad()
+        if self.params.fine_tune_bert:
+            self.bert_trainer.zero_grad()
+        loss.backward()
+        self.trainer.step()
+        if self.params.fine_tune_bert:
+            self.bert_trainer.step()
+
+        loss = loss.item()
+
+        torch.cuda.empty_cache()
+
+        return loss
+
+    def train_step(self, interaction, max_generation_length, snippet_alignment_probability=1.,
+                   sampling=False):
         """ Trains the interaction-level model on a single interaction.
 
         Inputs:
@@ -444,7 +917,8 @@ class SchemaInteractionATISModel(ATISModel):
                                                previous_query_states=previous_query_states,
                                                input_schema=input_schema,
                                                feed_gold_tokens=True,
-                                               training=True)
+                                               training=True,
+                                               sampling=sampling)
                 loss = prediction[1]
                 decoder_states = prediction[3]
                 total_gold_tokens += len(gold_query)

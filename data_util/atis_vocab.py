@@ -1,10 +1,12 @@
 """Gets and stores vocabulary for the ATIS data."""
 
 from . import snippets
-from .vocabulary import Vocabulary, UNK_TOK, DEL_TOK, EOS_TOK
+from .vocabulary import Vocabulary, UNK_TOK, DEL_TOK, EOS_TOK, CLS_TOK, SEP_TOK
 
 INPUT_FN_TYPES = [UNK_TOK, DEL_TOK, EOS_TOK]
 OUTPUT_FN_TYPES = [UNK_TOK, EOS_TOK]
+DIS_FUNC_TYPES = [CLS_TOK, SEP_TOK, UNK_TOK, EOS_TOK]
+
 
 MIN_INPUT_OCCUR = 1
 MIN_OUTPUT_OCCUR = 1
@@ -33,6 +35,8 @@ class ATISVocabulary():
             functional_types = OUTPUT_FN_TYPES
         elif is_input=='schema':
             functional_types = [UNK_TOK]
+        elif is_input=='discriminator':
+            functional_types = DIS_FUNC_TYPES
         else:
             functional_types = []
 

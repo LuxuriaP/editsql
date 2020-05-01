@@ -6,9 +6,12 @@ import random
 import sys
 import json
 import progressbar
-import model.torch_utils
-import data_util.sql_util
+import model.torch_utils as torch_utils
+import data_util.sql_util as sql_util
 import torch
+import torch.nn as nn
+import math
+import numpy as np
 
 def write_prediction(fileptr,
                      identifier,
@@ -167,7 +170,8 @@ def train_epoch_with_utterances(batches,
 def train_epoch_with_interactions(interaction_batches,
                                   params,
                                   model,
-                                  randomize=True):
+                                  randomize=True,
+                                  sampling=False):
     """Trains model for single epoch given batches of interactions.
 
     Inputs:
@@ -192,7 +196,10 @@ def train_epoch_with_interactions(interaction_batches,
         if 'sparc' in params.data_directory and "baseball_1" in interaction.identifier:
             continue
 
-        batch_loss = model.train_step(interaction, params.train_maximum_sql_length)
+        batch_loss = model.train_step(
+            interaction,
+            params.train_maximum_sql_length,
+            sampling=sampling)
 
         loss_sum += batch_loss
         torch.cuda.empty_cache()
@@ -595,3 +602,292 @@ def evaluate_using_predicted_queries(sample,
     predictions_file.close()
 
     return construct_averages(metrics_sums, total_num), predictions
+
+
+def dis_train_epoch(discriminator, dis_data_iter, criterion, optimizer):
+    total_loss = 0.
+    total_correct = 0.
+    total_real_correct = 0.
+    total_fake_correct = 0.
+    total_confidence = 0.
+    total_real_confidence = 0.
+    total_fake_confidence = 0.
+
+    progbar = get_progressbar("discriminator train     ",
+                              len(dis_data_iter))
+    progbar.start()
+
+    # for i, (src, tgt, label) in enumerate(dis_data_iter):
+    #     for j in range(dis_data_iter.batch_size):
+    #         pred = discriminator(src[j], tgt[j])
+    #         if pred.is_cuda:
+    #             label = label.cuda()
+    #         loss = criterion(pred, label[j].unsqueeze(dim=0))
+    #         total_loss += loss.item()
+    #         optimizer.zero_grad()
+    #         loss.backward()
+    #         optimizer.step()
+
+    #         # get accuracy
+    #         pred = pred.cpu().data.numpy()
+    #         pred = int(np.argmax(pred))
+
+    #         is_correct = (pred == label[j].item())
+
+    #         total_correct += is_correct
+    #         if label[j].item():
+    #             total_real_correct += is_correct
+    #         else:
+    #             total_fake_correct += is_correct
+
+    #     progbar.update(i)
+
+    dis_data_iter.reset()
+
+    for i, (src, tgt, label) in enumerate(dis_data_iter):
+        pred = discriminator(src, tgt)
+        if pred.is_cuda:
+            label = label.cuda()
+        loss = criterion(pred, label)
+        total_loss += loss.item()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # get accuracy/confidence
+        pred = np.exp(pred.cpu().data.numpy())
+        label = label.cpu().data.numpy()
+        label = np.around(label)
+        assert np.all(label) or np.all(np.logical_not(label))
+        pred[:, 0][pred[:, 0] == .5] = .5 + np.finfo(float).eps
+        indices = np.nonzero(pred > 0.5)
+        prob = pred[indices]
+
+        is_correct = (indices[1] == label)
+        # is_real = np.multiply(label, is_correct)
+        # is_fake = np.multiply(np.logical_not(label), is_correct)
+
+        # accuracy
+        total_correct += np.count_nonzero(is_correct)
+        # total_real_correct += np.count_nonzero(is_real)
+        # total_fake_correct += np.count_nonzero(is_fake)
+        if label[0]:
+            total_real_correct += np.count_nonzero(is_correct)
+        else:
+            total_fake_correct += np.count_nonzero(is_correct)
+
+        # confidence
+        total_confidence += np.sum(prob[np.nonzero(is_correct)])
+        # total_real_confidence += np.sum(prob[np.nonzero(is_real)])
+        # total_fake_confidence += np.sum(prob[np.nonzero(is_fake)])
+        if label[0]:
+            total_real_confidence += np.sum(prob[np.nonzero(is_correct)])
+        else:
+            total_fake_confidence += np.sum(prob[np.nonzero(is_correct)])
+
+        progbar.update(i)
+
+    progbar.finish()
+
+    out = {
+        "loss": math.exp(total_loss / len(dis_data_iter)),
+        "acc": total_correct / dis_data_iter.data_num,
+        "real_acc": total_real_correct / dis_data_iter.real_num,
+        "fake_acc": total_fake_correct / dis_data_iter.fake_num,
+        "con": total_confidence / dis_data_iter.data_num,
+        "real_con": total_real_confidence / dis_data_iter.real_num,
+        "fake_con": total_fake_confidence / dis_data_iter.fake_num
+    }
+
+    return out
+
+
+def dis_eval_epoch(discriminator, dis_data_iter, criterion):
+    total_loss = 0.
+    total_correct = 0.
+    total_real_correct = 0.
+    total_fake_correct = 0.
+    total_confidence = 0.
+    total_real_confidence = 0.
+    total_fake_confidence = 0.
+
+    progbar = get_progressbar("discriminator validation     ",
+                              len(dis_data_iter))
+    progbar.start()
+
+    # for i, (src, tgt, label) in enumerate(dis_data_iter):
+    #     for j in range(dis_data_iter.batch_size):
+    #         pred = discriminator(src[j], tgt[j])
+    #         if pred.is_cuda:
+    #             label = label.cuda()
+    #         loss = criterion(pred, label[j].unsqueeze(dim=0))
+    #         total_loss += loss.item()
+
+    #         # get accuracy
+    #         pred = pred.cpu().data.numpy()
+    #         pred = int(np.argmax(pred))
+
+    #         is_correct = (pred == label[j].item())
+
+    #         total_correct += is_correct
+    #         if label[j].item():
+    #             total_real_correct += is_correct
+    #         else:
+    #             total_fake_correct += is_correct
+
+    #     progbar.update(i)
+
+    dis_data_iter.reset()
+
+    for i, (src, tgt, label) in enumerate(dis_data_iter):
+        pred = discriminator(src, tgt)
+        if pred.is_cuda:
+            label = label.cuda()
+        loss = criterion(pred, label)
+        total_loss += loss.item()
+
+        pred = np.exp(pred.cpu().data.numpy())
+        label = label.cpu().data.numpy()
+        label = np.around(label)
+        assert np.all(label) or np.all(np.logical_not(label))
+        pred[:, 0][pred[:, 0] == .5] = .5 + np.finfo(float).eps
+        indices = np.nonzero(pred > 0.5)
+        prob = pred[indices]
+
+        is_correct = (indices[1] == label)
+        # is_real = np.multiply(label, is_correct)
+        # is_fake = np.multiply(np.logical_not(label), is_correct)
+
+        # accuracy
+        total_correct += np.count_nonzero(is_correct)
+        # total_real_correct += np.count_nonzero(is_real)
+        # total_fake_correct += np.count_nonzero(is_fake)
+        if label[0]:
+            total_real_correct += np.count_nonzero(is_correct)
+        else:
+            total_fake_correct += np.count_nonzero(is_correct)
+
+        # confidence
+        total_confidence += np.sum(prob[np.nonzero(is_correct)])
+        # total_real_confidence += np.sum(prob[np.nonzero(is_real)])
+        # total_fake_confidence += np.sum(prob[np.nonzero(is_fake)])
+        if label[0]:
+            total_real_confidence += np.sum(prob[np.nonzero(is_correct)])
+        else:
+            total_fake_confidence += np.sum(prob[np.nonzero(is_correct)])
+
+        # # get accuracy/confidence
+        # pred = np.exp(pred.cpu().data.numpy())
+        # label = label.cpu().data.numpy()
+        # label = np.around(label)
+        # pred[:, 0][pred[:, 0] == .5] = .5 + np.finfo(float).eps
+        # indices = np.nonzero(pred > 0.5)
+        # prob = pred[indices]
+
+        # is_correct = (indices[1] == label)
+        # is_real = np.multiply(label, is_correct)
+        # is_fake = np.multiply(np.logical_not(label), is_correct)
+
+        # # accuracy
+        # total_correct += np.count_nonzero(is_correct)
+        # total_real_correct += np.count_nonzero(is_real)
+        # total_fake_correct += np.count_nonzero(is_fake)
+
+        # # confidence
+        # total_confidence += np.sum(prob[np.nonzero(is_correct)])
+        # total_real_confidence += np.sum(prob[np.nonzero(is_real)])
+        # total_fake_confidence += np.sum(prob[np.nonzero(is_fake)])
+
+        progbar.update(i)
+
+    progbar.finish()
+
+    out = {
+        "loss": math.exp(total_loss / len(dis_data_iter)),
+        "acc": total_correct / dis_data_iter.data_num,
+        "real_acc": total_real_correct / dis_data_iter.real_num,
+        "fake_acc": total_fake_correct / dis_data_iter.fake_num,
+        "con": total_confidence / total_correct,
+        "real_con": total_real_confidence / total_real_correct,
+        "fake_con": total_fake_confidence / total_fake_correct
+    }
+
+    return out
+
+
+def generate_samples(generator, interactions,
+                     real_data_file, fake_data_file,
+                     max_gen_len, sampling=False,
+                     gen_num=float('inf'),
+                     train=False):
+
+    random.shuffle(interactions)
+
+    if gen_num < float('inf'):
+        progbar = get_progressbar("generate     ", gen_num)
+    else:
+        progbar = get_progressbar("generate     ", len(interactions))
+
+    real_options = []
+    real_data = []
+    fake_data = []
+
+    progbar.start()
+
+    for i, interaction in enumerate(interactions):
+        q, = interaction.gold_utterances()
+        schema = interaction.get_schema()
+
+        real_tgt = []
+        for tok in q.dis_gold_query():
+            if schema.in_vocabulary(tok, surface_form=True):
+                real_tgt.extend(schema.sf_to_emb_in(tok).split())
+            else:
+                real_tgt.append(tok)
+
+        real_datum = {"src": q.input_sequence(),
+                      "tgt": real_tgt}
+        # real_data.append(real_datum)
+        real_options.append(real_datum)
+
+        _, sample_mod, _, _ = generator(interaction, max_gen_len,
+                                        sampling=sampling)
+        # if sample_mod != real_tgt:
+        #     fake_datum = {"src": q.input_sequence(),
+        #                   "tgt": sample_mod}
+        #     fake_data.append(fake_datum)
+
+        fake_datum = {"src": q.input_sequence(),
+                      "tgt": sample_mod}
+
+        # if sample_mod == real_tgt:
+        #     if random.random() < 0.3:
+        #         fake_data.append(fake_datum)
+        #     else:
+        #         real_data.append(real_datum)
+
+        if train:
+            if sample_mod != real_tgt:
+                real_choice = random.choice(real_options)
+                real_data.append(real_choice)
+                real_options.remove(real_choice)
+                fake_data.append(fake_datum)
+        else:
+            if sample_mod == real_tgt:
+                real_data.append(real_datum)
+            else:
+                real_data.append(real_datum)
+                fake_data.append(fake_datum)
+
+        torch.cuda.empty_cache()
+
+        progbar.update(i)
+
+        if i >= gen_num - 1:
+            break
+
+    progbar.finish()
+
+    with open(real_data_file, 'w') as r, open(fake_data_file, 'w') as f:
+        json.dump(real_data, r, indent=4)
+        json.dump(fake_data, f, indent=4)

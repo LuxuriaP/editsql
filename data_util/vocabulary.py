@@ -7,6 +7,8 @@ import pickle
 UNK_TOK = "_UNK"  # Replaces out-of-vocabulary words.
 EOS_TOK = "_EOS"  # Appended to the end of a sequence to indicate its end.
 DEL_TOK = ";"
+CLS_TOK = "[CLS]"
+SEP_TOK = "[SEP]"
 
 
 class Vocabulary:

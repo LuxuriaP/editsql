@@ -72,8 +72,8 @@ def encode_snippets_with_states(snippets, states):
     return snippets
 
 def load_word_embeddings(input_vocabulary, output_vocabulary, output_vocabulary_schema, params):
-  print(output_vocabulary.inorder_tokens)
-  print()
+  # print(output_vocabulary.inorder_tokens)
+  # print()
 
   def read_glove_embedding(embedding_filename, embedding_size):
     glove_embeddings = {}
@@ -82,7 +82,8 @@ def load_word_embeddings(input_vocabulary, output_vocabulary, output_vocabulary_
       cnt = 1
       for line in f:
         cnt += 1
-        if params.debug or not params.train:
+        if params.debug or \
+                (params.gen_from_ckp and params.dis_from_ckp):
           if cnt == 1000:
             print('Read 1000 word embeddings')
             break

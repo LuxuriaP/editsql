@@ -59,6 +59,9 @@ class UtteranceItem():
         return self.interaction.utterances[self.utterance_index].gold_query_to_use + [
             vocab.EOS_TOK]
 
+    def dis_gold_query(self):
+        return self.interaction.utterances[self.utterance_index].gold_query_to_use
+
     def gold_edit_sequence(self):
         return self.interaction.utterances[self.utterance_index].gold_edit_sequence
 

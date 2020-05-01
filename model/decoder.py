@@ -11,6 +11,7 @@ from .token_predictor import PredictionInput, PredictionInputWithSchema
 import data_util.snippets as snippet_handler
 from . import embedder
 from data_util.vocabulary import EOS_TOK, UNK_TOK
+from model.model import get_token_indices
 
 def flatten_distribution(distribution_map, probabilities):
     """ Flattens a probability distribution given a map of "unique" values.
@@ -64,7 +65,8 @@ def flatten_distribution(distribution_map, probabilities):
 class SQLPrediction(namedtuple('SQLPrediction',
                                ('predictions',
                                 'sequence',
-                                'probability'))):
+                                'probability',
+                                'indices'))):
     """Contains prediction for a sequence."""
     __slots__ = ()
 
@@ -109,8 +111,8 @@ class SequencePredictorWithSchema(torch.nn.Module):
             decoder_lstm_states.append((h_0, c_0))
         return decoder_lstm_states
 
-    def get_output_token_embedding(self, output_token, input_schema, snippets):
-        if self.params.use_snippets and snippet_handler.is_snippet(output_token):
+    def get_output_token_embedding(self, output_token, input_schema, snippets=None):
+        if self.params.use_snippets and snippet_handler.is_snippet(output_token) and snippets:
             output_token_embedding = embedder.bow_snippets(output_token, snippets, self.output_embedder, input_schema)
         else:
             if input_schema:
@@ -143,7 +145,8 @@ class SequencePredictorWithSchema(torch.nn.Module):
                 previous_queries=None,
                 previous_query_states=None,
                 input_schema=None,
-                dropout_amount=0.):
+                dropout_amount=0.,
+                sampling=False):
         """ Generates a sequence. """
         index = 0
 
@@ -155,6 +158,7 @@ class SequencePredictorWithSchema(torch.nn.Module):
         predictions = []
         sequence = []
         probability = 1.
+        indices = []
 
         decoder_states = self._initialize_decoder_lstm(final_encoder_state)
 
@@ -182,6 +186,19 @@ class SequencePredictorWithSchema(torch.nn.Module):
 
                 if gold_sequence:
                     output_token = gold_sequence[index]
+
+                    distribution_map = prediction.aligned_tokens
+
+                    if self.params.consolidate:
+                        indices.append(get_token_indices(output_token, distribution_map))
+                    else:
+                        indices.append(distribution_map.index(output_token))
+
+                    # # Get a new probabilities and distribution_map consolidating duplicates
+                    # # distribution_map, probabilities = flatten_distribution(distribution_map, probabilities)
+
+                    # gold_index = distribution_map.index(output_token)
+                    # indices.append(gold_index)
 
                     output_token_embedding = self.get_output_token_embedding(output_token, input_schema, snippets)
 
@@ -212,31 +229,162 @@ class SequencePredictorWithSchema(torch.nn.Module):
                         probabilities = ((np.array(probabilities) * (1 - copy_switch)).tolist() + 
                                          (np.array(query_token_probabilities) * copy_switch).tolist()
                                          )
-                        distribution_map =  distribution_map + query_token_distribution_map
+                        distribution_map = distribution_map + query_token_distribution_map
                         assert len(probabilities) == len(distribution_map)
 
-                    # Get a new probabilities and distribution_map consolidating duplicates
-                    distribution_map, probabilities = flatten_distribution(distribution_map, probabilities)
+                    if self.params.consolidate:
+                        # Get a new probabilities and distribution_map consolidating duplicates
+                        dist_map, probs = flatten_distribution(distribution_map, probabilities)
+                    else:
+                        dist_map = distribution_map
+                        probs = probabilities
 
                     # Modify the probability distribution so that the UNK token can never be produced
-                    probabilities[distribution_map.index(UNK_TOK)] = 0.
-                    argmax_index = int(np.argmax(probabilities))
+                    probs[dist_map.index(UNK_TOK)] = 0.
+                    if sampling:
+                        samp_index = torch.tensor(probs).multinomial(1).item()
+                    else:
+                        samp_index = int(np.argmax(probs))
 
-                    argmax_token = distribution_map[argmax_index]
-                    sequence.append(argmax_token)
+                    token = dist_map[samp_index]
+                    sequence.append(token)
 
-                    output_token_embedding = self.get_output_token_embedding(argmax_token, input_schema, snippets)
+                    output_token_embedding = self.get_output_token_embedding(token, input_schema, snippets)
 
                     decoder_input = self.get_decoder_input(output_token_embedding, prediction)
 
-                    probability *= probabilities[argmax_index]
+                    if self.params.consolidate:
+                        indices.append(get_token_indices(token, distribution_map))
+                    else:
+                        indices.append(samp_index)
+                    probability *= probs[samp_index]
 
                     continue_generating = False
-                    if index < max_generation_length and argmax_token != EOS_TOK:
+                    if index < max_generation_length and token != EOS_TOK:
                         continue_generating = True
 
             index += 1
 
+        if self.start_token_embedding.is_cuda:
+            if self.params.consolidate:
+                indices = [torch.cuda.LongTensor(per_tok) for per_tok in indices]
+            else:
+                indices = torch.cuda.LongTensor(indices)
+        else:
+            if self.params.consolidate:
+                indices = [torch.LongTensor(per_tok) for per_tok in indices]
+            else:
+                indices = torch.LongTensor(indices)
+
         return SQLPrediction(predictions,
                              sequence,
-                             probability)
+                             probability,
+                             indices)
+
+    def sample(self,
+               final_encoder_state, encoder_states, schema_states,
+               max_generation_length, given=None, given_preds=None,
+               input_schema=None, dropout_amount=0.):
+        """ Samples remainder of sequence starting from current state.
+
+        Args:
+            final_encoder_state
+            encoder_states
+            schema_states
+            max_generation_length
+            given (List[str]): current state
+            given_preds (List[TokenPrediction]): None if and only if
+                sequence is None
+            input_schema
+            dropout_amount
+
+        Returns:
+            sample (List[str])
+            sample_preds (List[TokenPrediction])
+        """
+        context_size = self.input_size - self.params.output_embedding_size
+
+        decoder_states = self._initialize_decoder_lstm(final_encoder_state)
+
+        if self.start_token_embedding.is_cuda:
+            decoder_input = torch.cat(
+                [self.start_token_embedding,
+                 torch.cuda.FloatTensor(context_size).fill_(0)],
+                dim=0)
+        else:
+            decoder_input = torch.cat(
+                [self.start_token_embedding,
+                 torch.zeros(context_size)],
+                dim=0)
+
+        sample, sample_preds = [], []
+        prob = 1.
+        if given and given_preds:
+            given_len = len(given)
+            for i in range(given_len):
+                _, decoder_state, decoder_states = \
+                    torch_utils.forward_one_multilayer(self.lstms,
+                                                       decoder_input,
+                                                       decoder_states,
+                                                       dropout_amount)
+                sample.append(given[i])
+                sample_preds.append(given_preds[i])
+
+                output_token_embedding = self.get_output_token_embedding(
+                    given[i], input_schema)
+                decoder_input = self.get_decoder_input(
+                    output_token_embedding, given_preds[i])
+        else:
+            given_len = 0
+
+        for i in range(given_len, max_generation_length):
+            _, decoder_state, decoder_states = \
+                torch_utils.forward_one_multilayer(self.lstms,
+                                                   decoder_input,
+                                                   decoder_states,
+                                                   dropout_amount)
+            pred_input = PredictionInputWithSchema(
+                decoder_state=decoder_state,
+                input_hidden_states=encoder_states,
+                schema_states=schema_states,
+                snippets=None,
+                input_sequence=None,
+                previous_queries=None,
+                previous_query_states=None,
+                input_schema=input_schema
+            )
+
+            pred = self.token_predictor(
+                pred_input, dropout_amount=dropout_amount)
+            sample_preds.append(pred)
+
+            assert pred.scores.dim() == 1
+            prob_dist = F.softmax(pred.scores, dim=0) \
+                .cpu() \
+                .data \
+                .numpy() \
+                .tolist()
+
+            dist_map = pred.aligned_tokens
+            assert len(prob_dist) == len(dist_map)
+
+            # consolidate duplicates
+            # dist_map, prob_dist = flatten_distribution(dist_map, prob_dist)
+
+            # Modify Prob(UNK) -> 0
+            prob_dist[dist_map.index(UNK_TOK)] = 0.
+            sampled_index = torch.tensor(prob_dist).multinomial(1).item()
+            sampled_token = dist_map[sampled_index]
+            sample.append(sampled_token)
+            prob *= prob_dist[sampled_index]
+
+            if sampled_token == EOS_TOK:
+                break
+
+            output_token_embedding = self.get_output_token_embedding(
+                sampled_token, input_schema)
+            decoder_input = self.get_decoder_input(
+                output_token_embedding, pred)
+
+        return sample, sample_preds, prob
+

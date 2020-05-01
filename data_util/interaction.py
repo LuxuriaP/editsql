@@ -152,6 +152,13 @@ class Schema:
 
         return self.column_name_embeddings[column_name_id]
 
+    def sf_to_emb_in(self, column_name):
+        column_name_id = self.column_names_surface_form_to_id[column_name]
+        column_name_embedder_input = self.column_names_embedder_input[column_name_id]
+
+        return column_name_embedder_input
+
+
 class Interaction:
     """ ATIS interaction class.
 
